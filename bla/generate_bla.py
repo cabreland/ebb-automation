@@ -53,13 +53,10 @@ CC_RECIPIENTS = [
     # Chris excluded — BoldSign sender identity can't be CC'd
 ]
 
-# Signature/date field positions on page 3 (PDF points, 72 DPI)
-# Signature underscore lines are at y=413, "Signature:" labels at y=392
-# Date underscore lines start after "Date:" text (Broker x=75, Seller x=309)
-SELLER_SIG_BOUNDS = {"X": 288, "Y": 405, "Width": 140, "Height": 25}
-SELLER_DATE_BOUNDS = {"X": 310, "Y": 355, "Width": 135, "Height": 15}
-BROKER_SIG_BOUNDS = {"X": 54, "Y": 405, "Width": 140, "Height": 25}
-BROKER_DATE_BOUNDS = {"X": 76, "Y": 355, "Width": 135, "Height": 15}
+# Signature/date field bounds are now DERIVED from the actual template PDF
+# (see get_signature_bounds() below) instead of hand-measured constants.
+# This survives template edits — if the BLA layout shifts, bounds shift with it.
+SIGNATURE_PAGE_INDEX = 2  # page 3, 0-indexed
 
 
 # ── GHL Helpers ─────────────────────────────────────────────────────────────
@@ -145,14 +142,69 @@ def build_template_values(contact: dict, field_map: dict) -> dict[str, str]:
     }
 
 
+def get_signature_bounds(template_pdf_path: str) -> dict[str, dict]:
+    """Derive signature/date field bounds from the actual 'Date:'/'Signature:'
+    label and underscore-line positions on the signing page, instead of
+    hand-measured constants. Assumes Broker = left column, Seller = right
+    column (matches current page-3 layout). Re-derives automatically if the
+    template is ever edited — no more manual re-measuring from screenshots.
+    """
+    doc = fitz.open(template_pdf_path)
+    page = doc[SIGNATURE_PAGE_INDEX]
+    blocks = page.get_text("dict")["blocks"]
+
+    labels: dict[str, tuple[float, float, float, float]] = {}
+    for block in blocks:
+        if "lines" not in block:
+            continue
+        for line in block["lines"]:
+            for span in line["spans"]:
+                txt = span["text"]
+                if txt.startswith("Date:"):
+                    col = "broker" if span["bbox"][0] < 200 else "seller"
+                    labels[f"{col}_date"] = span["bbox"]
+                elif txt.strip().startswith("Signature:"):
+                    col = "broker" if span["bbox"][0] < 200 else "seller"
+                    labels[f"{col}_sig_label"] = span["bbox"]
+                elif txt.strip().startswith("_") and len(txt.strip()) > 5:
+                    col = "broker" if span["bbox"][0] < 200 else "seller"
+                    # First underscore run after the signature label = the sig line
+                    if f"{col}_sig_label" in labels and f"{col}_sig_line" not in labels:
+                        labels[f"{col}_sig_line"] = span["bbox"]
+    doc.close()
+
+    required = ["broker_date", "broker_sig_line", "seller_date", "seller_sig_line"]
+    missing = [k for k in required if k not in labels]
+    if missing:
+        raise RuntimeError(
+            f"Could not locate signature page anchors: {missing}. "
+            f"Template layout may have changed — check SIGNATURE_PAGE_INDEX "
+            f"and the label text on the signing page."
+        )
+
+    def bounds_for(bbox, width: float, height: float) -> dict:
+        x0, y0, _, _ = bbox
+        return {"X": round(x0, 1), "Y": round(y0 - 2, 1), "Width": width, "Height": height}
+
+    return {
+        "seller_sig": bounds_for(labels["seller_sig_line"], 140, 25),
+        "seller_date": bounds_for(labels["seller_date"], 135, 15),
+        "broker_sig": bounds_for(labels["broker_sig_line"], 140, 25),
+        "broker_date": bounds_for(labels["broker_date"], 135, 15),
+    }
+
+
 def fill_bla_pdf(template_values: dict[str, str], output_path: str) -> str:
     """Fill the BLA PDF template with real values, return output path.
 
-    Detects bold/regular font per placeholder and uses the matching
-    PyMuPDF built-in font (tibo for bold, tiro for regular) at 9.5pt
-    to match the original document formatting.
+    Detects bold/regular font + size per placeholder from the source PDF,
+    erases the placeholder via redaction, then draws the replacement text
+    at the exact detected font size using insert_text(). We do NOT pass the
+    replacement text to add_redact_annot()'s built-in text param — that mode
+    auto-shrinks text to fit the redaction box, which was causing small,
+    vertically-sunken replacement text (the box height is only ~1pt taller
+    than the font, so longer replacement strings got squeezed).
     """
-    # Map PDF font names → PyMuPDF built-in equivalents
     FONT_MAP = {
         "TimesNewRomanPSMT": "tiro",
         "TimesNewRomanPS-BoldMT": "tibo",
@@ -164,8 +216,8 @@ def fill_bla_pdf(template_values: dict[str, str], output_path: str) -> str:
 
     doc = fitz.open(BLA_TEMPLATE_PDF)
 
-    for page_idx, page in enumerate(doc):
-        # First: detect font used for each placeholder on this page
+    for page in doc:
+        # First: detect font + size used for each placeholder on this page
         placeholder_fonts: dict[str, tuple[str, float]] = {}
         blocks = page.get_text("dict")["blocks"]
         for block in blocks:
@@ -179,24 +231,35 @@ def fill_bla_pdf(template_values: dict[str, str], output_path: str) -> str:
                             pymupdf_font = FONT_MAP.get(span["font"], "tiro")
                             placeholder_fonts[var_name] = (pymupdf_font, span["size"])
 
-        # Second: redact + replace with correct font
+        # Second: redact to ERASE ONLY (no replacement text passed to BoldSign-
+        # style redaction — that's what auto-shrinks). Queue insertion jobs to
+        # run after apply_redactions() commits the erase.
+        insertion_jobs: list[tuple[fitz.Rect, str, str, float]] = []
         for var_name, value in template_values.items():
             if not value:
                 continue
             search = f"{{{{{var_name}}}}}"
             instances = page.search_for(search)
             font_name, font_size = placeholder_fonts.get(var_name, ("tiro", 9.5))
-
             for inst in instances:
-                page.add_redact_annot(
-                    inst,
-                    value,
-                    fontname=font_name,
-                    fontsize=font_size,
-                    fill=(1, 1, 1),
-                    text_color=(0, 0, 0),
-                )
+                page.add_redact_annot(inst, fill=(1, 1, 1))
+                insertion_jobs.append((inst, value, font_name, font_size))
+
         page.apply_redactions()
+
+        # Third: draw replacement text ourselves at the exact font size,
+        # anchored to the correct baseline. insert_text()'s origin point IS
+        # the baseline (not the box top), so we offset up from the box's
+        # bottom edge by ~0.2 * fontsize to compensate for the descender gap.
+        for rect, value, font_name, font_size in insertion_jobs:
+            baseline_y = rect.y1 - (font_size * 0.2)
+            page.insert_text(
+                (rect.x0, baseline_y),
+                value,
+                fontname=font_name,
+                fontsize=font_size,
+                color=(0, 0, 0),
+            )
 
     doc.save(output_path)
     doc.close()
@@ -225,8 +288,12 @@ def build_multipart_body(
     message: str,
     seller_name: str,
     seller_email: str,
+    sig_bounds: dict[str, dict],
 ) -> tuple[str, str]:
     """Build multipart/form-data body for BoldSign /v1/document/send.
+
+    sig_bounds comes from get_signature_bounds() — derived from the actual
+    template PDF rather than hardcoded constants.
 
     Returns (content_type, base64_body).
     """
@@ -264,7 +331,7 @@ def build_multipart_body(
     add("Signers[0][FormFields][0][PageNumber]", "3")
     add("Signers[0][FormFields][0][Id]", "SellerSignature")
     add("Signers[0][FormFields][0][IsRequired]", "true")
-    for k, v in SELLER_SIG_BOUNDS.items():
+    for k, v in sig_bounds["seller_sig"].items():
         add(f"Signers[0][FormFields][0][Bounds][{k}]", str(v))
 
     # Seller date field
@@ -272,7 +339,7 @@ def build_multipart_body(
     add("Signers[0][FormFields][1][PageNumber]", "3")
     add("Signers[0][FormFields][1][Id]", "SellerDate")
     add("Signers[0][FormFields][1][IsRequired]", "true")
-    for k, v in SELLER_DATE_BOUNDS.items():
+    for k, v in sig_bounds["seller_date"].items():
         add(f"Signers[0][FormFields][1][Bounds][{k}]", str(v))
 
     # Signer 2: Broker (Jarrod)
@@ -286,7 +353,7 @@ def build_multipart_body(
     add("Signers[1][FormFields][0][PageNumber]", "3")
     add("Signers[1][FormFields][0][Id]", "BrokerSignature")
     add("Signers[1][FormFields][0][IsRequired]", "true")
-    for k, v in BROKER_SIG_BOUNDS.items():
+    for k, v in sig_bounds["broker_sig"].items():
         add(f"Signers[1][FormFields][0][Bounds][{k}]", str(v))
 
     # Broker date field
@@ -294,7 +361,7 @@ def build_multipart_body(
     add("Signers[1][FormFields][1][PageNumber]", "3")
     add("Signers[1][FormFields][1][Id]", "BrokerDate")
     add("Signers[1][FormFields][1][IsRequired]", "true")
-    for k, v in BROKER_DATE_BOUNDS.items():
+    for k, v in sig_bounds["broker_date"].items():
         add(f"Signers[1][FormFields][1][Bounds][{k}]", str(v))
 
     # CC recipients
@@ -321,12 +388,13 @@ def build_multipart_body(
 
 
 async def send_to_boldsign(pdf_path: str, title: str, message: str,
-                           seller_name: str, seller_email: str) -> dict:
+                           seller_name: str, seller_email: str,
+                           sig_bounds: dict[str, dict]) -> dict:
     """Send filled BLA PDF to BoldSign for e-signatures."""
     from sdk.tools.pd_boldsign import pd_boldsign_proxy_post
 
     content_type, body_b64 = build_multipart_body(
-        pdf_path, title, message, seller_name, seller_email
+        pdf_path, title, message, seller_name, seller_email, sig_bounds
     )
 
     result = await pd_boldsign_proxy_post(
@@ -404,8 +472,9 @@ async def main():
     else:
         title = f"Business Listing Agreement — {biz_name}"
         message = f"Please review and sign the Business Listing Agreement for {biz_name}."
+        sig_bounds = get_signature_bounds(BLA_TEMPLATE_PDF)
         print(f"\n📤 Sending to BoldSign: {title}")
-        result = await send_to_boldsign(output_pdf, title, message, name, email)
+        result = await send_to_boldsign(output_pdf, title, message, name, email, sig_bounds)
         print(f"   BoldSign response: {json.dumps(result, indent=2, default=str)[:1000]}")
 
     # Output
