@@ -1,0 +1,32 @@
+{
+  "location_id": "VrIFtlCW5GvoCpf0Spte",
+  "seller_pipeline_id": "Pj4Z15z4bAywO3GIC0u3",
+  "pipeline_stages": {
+    "interested": "fbfcc821",
+    "discovery_call": "fb67e8d3",
+    "qualified_advance": "54074be3",
+    "nda_sent": "70a2b750",
+    "financials_requested": "c6bf69f9",
+    "needs_review": "9bc3bc49",
+    "approved_for_listing": "f2c97198",
+    "listing_agreement_sent": "3f233619",
+    "listing_agreement_signed": "effd008a"
+  },
+  "custom_field_map": {
+    "JVlSWIjaE9Zw3Nm7WyUP": "contact.business_name",
+    "wwA1IyZoZvId5LhTysK8": "contact.business_address",
+    "gBLRxnvDN0Im18Z434Zp": "contact.business_website",
+    "x4zFeTQonNTUPMBNU6Pf": "contact.purchase_price",
+    "hHD4Gk7WC2b3ogFNLaaq": "contact.commission_",
+    "pZewuPB8FSoMcwPazNt1": "contact.seller_title"
+  },
+  "team_users": {
+    "chris": "OIXp9oPFccdqnSltxVK6",
+    "jack": "2lUpZhHNFWWJ8D6d1KtI",
+    "jarrod": "zUK2XpaJHuGn1moKdGTL",
+    "pratt": "xLIUsPff6IoqmcUFjU9H",
+    "ty": "UxNRKIoziTzUzWTpewKO",
+    "sarb": "WwBwgNmrIJfwu82fOCgT",
+    "aiden": "nNBLMzsYLqH12a4wR5wb"
+  }
+}
