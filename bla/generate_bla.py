@@ -50,26 +50,21 @@ BROKER = {
 }
 
 # Template field ID → GHL value key mapping
-# Seller role (index 1)
+# All fillable fields are on the Seller role (index 1).
+# Broker role (index 2) only has Signature1 + DatePicker1 (auto-fill on sign).
 SELLER_TEXTBOX_FIELDS = {
     "SellerAddress":      "business_address",
     "WebsiteAddress":     "business_website",
-    "SellerCompanyName":  "business_name",     # page 1 occurrence 2
-    "TextBox2":           "business_name",     # page 1 occurrence 1
+    "SellerCompanyName":  "business_name",     # page 1 "under the name '___'"
+    "TextBox2":           "business_name",     # page 1 "Broker, and ___"
     "TextBox3":           "business_name",     # page 3 "SELLER: ___"
     "SellerName":         "seller_name",       # page 3
     "SellerTitle":        "seller_title",      # page 3
+    "ListingPrice":       "purchase_price_formatted",  # section 4
+    "TextBox1":           "commission_percentage",      # section 5
 }
 SELLER_DATE_FIELDS = {
     "EditableDate1":      "start_date",        # "entered into as of"
-}
-
-# Broker role (index 2)
-BROKER_TEXTBOX_FIELDS = {
-    "ListingPrice":       "purchase_price_formatted",
-    "TextBox1":           "commission_percentage",
-}
-BROKER_DATE_FIELDS = {
     "EngagementStartDate": "start_date",       # "commencing on"
     "AgreementEndDate":    "end_date",         # "ending at 11:59 p.m. on"
 }
@@ -221,28 +216,11 @@ def build_template_send_body(
             seller_field_idx += 1
 
     # ── Role 1 = Broker (template index 2) ──
+    # Broker only has Signature1 + DatePicker1 (auto-fill on sign) — no ExistingFormFields needed
     add("Roles[1][RoleIndex]", "2")
     add("Roles[1][SignerName]", BROKER["name"])
     add("Roles[1][SignerEmail]", BROKER["email"])
     add("Roles[1][SignerOrder]", "2")
-
-    broker_field_idx = 0
-
-    # Textbox fields
-    for field_id, value_key in BROKER_TEXTBOX_FIELDS.items():
-        value = template_values.get(value_key, "")
-        if value:
-            add(f"Roles[1][ExistingFormFields][{broker_field_idx}][Id]", field_id)
-            add(f"Roles[1][ExistingFormFields][{broker_field_idx}][Value]", value)
-            broker_field_idx += 1
-
-    # Editable date fields
-    for field_id, value_key in BROKER_DATE_FIELDS.items():
-        value = template_values.get(value_key, "")
-        if value:
-            add(f"Roles[1][ExistingFormFields][{broker_field_idx}][Id]", field_id)
-            add(f"Roles[1][ExistingFormFields][{broker_field_idx}][Value]", value)
-            broker_field_idx += 1
 
     # Build body
     text_body = "\r\n".join(parts) + "\r\n"
@@ -320,11 +298,7 @@ async def main():
         v = template_values.get(value_key, "")
         status = "✅" if v else "⚠️ "
         print(f"    {status} {field_id:25s} → {value_key:30s} = {v or '(empty)'}")
-    print(f"  Broker role fields:")
-    for field_id, value_key in {**BROKER_TEXTBOX_FIELDS, **BROKER_DATE_FIELDS}.items():
-        v = template_values.get(value_key, "")
-        status = "✅" if v else "⚠️ "
-        print(f"    {status} {field_id:25s} → {value_key:30s} = {v or '(empty)'}")
+    print(f"  Broker role: Signature1 + DatePicker1 only (auto-fill on sign)")
 
     biz_name = template_values.get("business_name") or name
 
