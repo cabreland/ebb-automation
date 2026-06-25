@@ -1,8 +1,7 @@
 {
   "location_id": "VrIFtlCW5GvoCpf0Spte",
   "seller_pipeline_id": "Pj4Z15z4bAywO3GIC0u3",
-  "boldsign_document_id_field": null,
+  "boldsign_document_id_field": "h00EbkYqD1xL16dtagDs",
   "boldsign_template_id": "0dd97a31-c600-4b5a-abd1-356ea2ad8745",
-  "boldsign_brand_id": "3ec989d6-4615-4f72-82c3-64863d0a123e",
-  "_note": "boldsign_document_id_field will be set after GHL custom field is created"
+  "boldsign_brand_id": "3ec989d6-4615-4f72-82c3-64863d0a123e"
 }
