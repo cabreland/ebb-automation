@@ -7,7 +7,7 @@ On approval:
   2. Push extracted fields to GHL custom fields
   3. Push call summary to GHL contact notes
   4. Auto-assign contact/opp to whoever recorded the call
-  5. Advance seller pipeline opp → "Discovery Call" stage
+  5. Advance seller pipeline opp → "Qualified" stage (discovery call already happened)
   6. Auto-send BLA via BoldSign (if contact has required fields)
   7. Store BoldSign document ID in GHL
   8. Advance pipeline → "Listing Agreement Sent"
@@ -44,11 +44,18 @@ SELLER_PIPELINE_ID = "Pj4Z15z4bAywO3GIC0u3"
 STAGE_INTERESTED = "fbfcc821-f046-4bc9-9a1e-b06b3f8bae68"
 STAGE_DISCOVERY = "fb67e8d3-8b4a-4663-a414-7d112eeb9faf"
 STAGE_QUALIFIED = "54074be3-1289-4c6b-a4cf-62f971e719dd"
-STAGE_BLA_SENT = "3f233619-1714-4a45-9fa6-7319ca3dd663"
-STAGE_BLA_SIGNED = "effd008a-aabb-48d9-95e3-7710ec785f03"
 
-# Stages that are eligible for BLA auto-send (haven't already been sent/signed)
-BLA_ELIGIBLE_STAGES = {STAGE_INTERESTED, STAGE_DISCOVERY, STAGE_QUALIFIED}
+# Stage ordering (index = position). Used to prevent moving opps backwards.
+SELLER_STAGE_ORDER = [
+    STAGE_INTERESTED,                                    # 0  Interested
+    STAGE_DISCOVERY,                                     # 1  Discovery Call
+    STAGE_QUALIFIED,                                     # 2  Qualified
+    "3f233619-1714-4a45-9fa6-7319ca3dd663",              # 3  Listing Agreement Sent
+    "effd008a-aabb-48d9-95e3-7710ec785f03",              # 4  Listing Agreement Signed - Deal Won
+]
+# BLA send is decoupled from this script.
+# It fires via a separate event-driven trigger when a human moves
+# the opp to "Ready to Send BLA" stage in the Seller Pipeline.
 
 # ── GHL Custom Field IDs ────────────────────────────────────────────────
 CUSTOM_FIELDS = {
@@ -61,7 +68,7 @@ CUSTOM_FIELDS = {
     "purchase_price": "x4zFeTQonNTUPMBNU6Pf",
 }
 # Set after GHL field creation (populated at runtime)
-BOLDSIGN_DOC_ID_FIELD = None  # Will be set from config
+# BOLDSIGN_DOC_ID_FIELD is handled by the BLA send script, not this approval flow
 
 # ── Fathom recorder email → GHL user ID ─────────────────────────────────
 EMAIL_TO_GHL_USER = {
@@ -408,10 +415,37 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
                 print(f"    ⚠️ Error creating opp: {e}")
                 return False, None
 
-        # Advance existing opp(s)
+        # Advance existing opp(s) — but never move backwards
         for opp in opps:
             opp_id = opp.get("id")
             current_stage = opp.get("pipelineStageId")
+
+            # Don't move backwards — if opp is already at or past target, skip
+            try:
+                current_idx = SELLER_STAGE_ORDER.index(current_stage)
+                target_idx = SELLER_STAGE_ORDER.index(target_stage)
+                if current_idx >= target_idx:
+                    stage_names = {
+                        STAGE_INTERESTED: "Interested",
+                        STAGE_DISCOVERY: "Discovery Call",
+                        STAGE_QUALIFIED: "Qualified",
+                    }
+                    current_name = stage_names.get(current_stage, current_stage[:12])
+                    print(f"    ⏭️ Opp {opp_id} already at '{current_name}' — skipping advance (won't move backwards)")
+                    # Still assign if needed
+                    if ghl_user_id:
+                        try:
+                            await pd_highlevel_oauth_proxy_put(
+                                url=f"{GHL_API}/opportunities/{opp_id}",
+                                json_body={"assignedTo": ghl_user_id},
+                                headers=GHL_HEADERS,
+                            )
+                        except Exception:
+                            pass
+                    return True, opp_id
+            except ValueError:
+                # Stage not in our ordering list — proceed with advance
+                pass
 
             try:
                 update_body = {"pipelineStageId": target_stage}
@@ -425,8 +459,7 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
                 )
                 stage_name = {
                     STAGE_DISCOVERY: "Discovery Call",
-                    STAGE_BLA_SENT: "Listing Agreement Sent",
-                    STAGE_BLA_SIGNED: "Listing Agreement Signed",
+                    STAGE_QUALIFIED: "Qualified",
                 }.get(target_stage, target_stage[:12])
                 print(f"    📈 Advanced opp {opp_id} → {stage_name}")
                 return True, opp_id
@@ -438,29 +471,6 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
     except Exception as e:
         print(f"    ⚠️ Error searching opps: {e}")
         return False, None
-
-
-async def get_opp_stage(contact_id: str) -> str | None:
-    """Get the current pipeline stage for a contact's seller opp."""
-    try:
-        result = await pd_highlevel_oauth_proxy_get(
-            url=f"{GHL_API}/opportunities/search",
-            query_params={
-                "location_id": LOCATION_ID,
-                "pipeline_id": SELLER_PIPELINE_ID,
-                "contact_id": contact_id,
-                "limit": "1",
-            },
-            headers=GHL_HEADERS,
-        )
-        parsed = json.loads(result.get("content", "{}"))
-        body = parsed.get("body", parsed)
-        opps = body.get("opportunities", [])
-        if opps:
-            return opps[0].get("pipelineStageId")
-    except Exception:
-        pass
-    return None
 
 
 async def push_to_ghl(extraction_id: str, extraction: dict, recording: dict) -> dict:
@@ -512,143 +522,11 @@ async def push_to_ghl(extraction_id: str, extraction: dict, recording: dict) -> 
     # 5. Auto-assign to recorder
     results["assigned"] = await auto_assign_contact(contact_id, recorder_email)
 
-    # 6. Advance pipeline stage to Discovery Call
-    advanced, _ = await advance_pipeline_stage(contact_id, recorder_email, STAGE_DISCOVERY)
+    # 6. Advance pipeline stage to Qualified (discovery call already happened)
+    advanced, _ = await advance_pipeline_stage(contact_id, recorder_email, STAGE_QUALIFIED)
     results["stage_advanced"] = advanced
 
     return results
-
-
-# ─────────────────────────────────────────────────────────────────────────
-# BLA AUTO-SEND (fires after GHL push on approval)
-# ─────────────────────────────────────────────────────────────────────────
-
-async def auto_send_bla(contact_id: str, seller_email: str, recorder_email: str) -> dict:
-    """
-    Auto-generate and send BLA via BoldSign after extraction approval.
-    
-    Steps:
-      1. Pull full contact from GHL (fields just got pushed)
-      2. Build template values from GHL fields
-      3. Send via BoldSign template
-      4. Store BoldSign doc ID in GHL custom field
-      5. Advance pipeline → "Listing Agreement Sent"
-    
-    Returns dict with bla_sent, document_id, stage_advanced.
-    """
-    # Import BLA generation functions
-    from skills.deal_management.scripts.generate_bla import (
-        get_contact,
-        extract_ghl_fields,
-        build_template_values,
-        send_via_template,
-    )
-
-    bla_result = {
-        "bla_sent": False,
-        "document_id": None,
-        "stage_advanced": False,
-        "error": None,
-    }
-
-    print(f"\n  📄 BLA Auto-Send for contact {contact_id}")
-
-    try:
-        # 1. Pull fresh contact data (fields just pushed)
-        contact = await get_contact(contact_id)
-        name = f"{contact.get('firstName', '')} {contact.get('lastName', '')}".strip()
-        email = contact.get("email", seller_email)
-
-        if not email:
-            bla_result["error"] = "No email on contact"
-            print(f"    ❌ No email on contact — cannot send BLA")
-            return bla_result
-
-        # 2. Build template values
-        field_map = extract_ghl_fields(contact)
-        template_values = build_template_values(contact, field_map)
-
-        biz_name = template_values.get("business_name") or name
-        print(f"    Business: {biz_name}")
-        print(f"    Seller: {name} ({email})")
-
-        # Check minimum required fields
-        missing_critical = []
-        if not template_values.get("business_name"):
-            missing_critical.append("business_name")
-        if not template_values.get("seller_name"):
-            missing_critical.append("seller_name")
-
-        if missing_critical:
-            bla_result["error"] = f"Missing critical fields: {missing_critical}"
-            print(f"    ⚠️ Missing critical fields: {missing_critical} — BLA not sent")
-            print(f"    ℹ️ BLA can be sent manually: generate_bla.py \"{email}\"")
-            return bla_result
-
-        # Log all field values
-        filled = sum(1 for v in template_values.values() if v)
-        total = len(template_values)
-        print(f"    📋 Fields: {filled}/{total} filled")
-        for k, v in template_values.items():
-            status = "✅" if v else "⚠️"
-            print(f"      {status} {k}: {v or '(empty)'}")
-
-        # 3. Send via BoldSign template
-        print(f"    📤 Sending BLA via BoldSign...")
-        result = await send_via_template(name, email, template_values)
-        parsed = json.loads(result.get("content", "{}"))
-        body = parsed.get("body", parsed)
-        status_code = parsed.get("status_code")
-
-        if status_code == 201:
-            document_id = body.get("documentId")
-            bla_result["bla_sent"] = True
-            bla_result["document_id"] = document_id
-            print(f"    ✅ BLA sent! Document ID: {document_id}")
-
-            # 4. Store BoldSign doc ID in GHL custom field
-            if BOLDSIGN_DOC_ID_FIELD and document_id:
-                try:
-                    await pd_highlevel_oauth_update_contact(
-                        contactId=contact_id,
-                        additionalOptions={
-                            "customFields": [{
-                                "id": BOLDSIGN_DOC_ID_FIELD,
-                                "field_value": document_id,
-                            }]
-                        },
-                    )
-                    print(f"    📦 Stored BoldSign doc ID in GHL")
-                except Exception as e:
-                    print(f"    ⚠️ Could not store doc ID in GHL: {e}")
-
-            # Also add a GHL note
-            try:
-                await pd_highlevel_oauth_proxy_post(
-                    url=f"{GHL_API}/contacts/{contact_id}/notes",
-                    json_body={
-                        "body": f"📄 BLA sent via BoldSign\nDocument ID: {document_id}\nBusiness: {biz_name}\nSent to: {email}\nBroker counter-signer: Jarrod Swanger",
-                        "userId": None,
-                    },
-                    headers=GHL_HEADERS,
-                )
-            except Exception:
-                pass
-
-            # 5. Advance pipeline → Listing Agreement Sent
-            advanced, _ = await advance_pipeline_stage(
-                contact_id, recorder_email, STAGE_BLA_SENT
-            )
-            bla_result["stage_advanced"] = advanced
-        else:
-            bla_result["error"] = f"BoldSign returned {status_code}: {body}"
-            print(f"    ❌ BoldSign error ({status_code}): {json.dumps(body, default=str)[:500]}")
-
-    except Exception as e:
-        bla_result["error"] = str(e)
-        print(f"    ❌ BLA auto-send failed: {e}")
-
-    return bla_result
 
 
 # ─────────────────────────────────────────────────────────────────────────
@@ -656,15 +534,6 @@ async def auto_send_bla(contact_id: str, seller_email: str, recorder_email: str)
 # ─────────────────────────────────────────────────────────────────────────
 
 async def main():
-    # Load BoldSign doc ID field from config if available
-    global BOLDSIGN_DOC_ID_FIELD
-    try:
-        with open("/work/skills/deal_management/references/ghl_config.json") as f:
-            config = json.load(f)
-            BOLDSIGN_DOC_ID_FIELD = config.get("boldsign_document_id_field")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
-
     pending = await get_pending_extractions()
     if not pending:
         print("No pending extractions to check.")
@@ -721,35 +590,17 @@ async def main():
                 if full_data:
                     recording = full_data.get("recording", {})
 
-                    # Step 1: Push to GHL
+                    # Push to GHL (fields + notes + assign + stage advance ONLY)
+                    # BLA send is NOT triggered here — it's decoupled and fires
+                    # only when a human moves the opp to "Ready to Send BLA" stage
                     push_results = await push_to_ghl(ext_id, full_data, recording)
                     ghl_status = "✅" if push_results["contact_matched"] else "⚠️ PARTIAL"
                     print(f"  {business}: GHL push {ghl_status}")
 
-                    # Step 2: Auto-send BLA (if GHL push succeeded)
-                    if push_results["contact_matched"] and push_results.get("seller_email"):
-                        contact_id = push_results["contact_id"]
-                        seller_email = push_results["seller_email"]
-                        recorder_email = recording.get("recordedByEmail", "")
-
-                        # Check if opp is in a BLA-eligible stage
-                        current_stage = await get_opp_stage(contact_id)
-                        if current_stage in BLA_ELIGIBLE_STAGES:
-                            bla_results = await auto_send_bla(
-                                contact_id, seller_email, recorder_email
-                            )
-                            if bla_results["bla_sent"]:
-                                print(f"  {business}: 📄 BLA sent → {bla_results['document_id']}")
-                            else:
-                                print(f"  {business}: ⚠️ BLA not sent — {bla_results.get('error', 'unknown')}")
-                        else:
-                            stage_name = {
-                                STAGE_BLA_SENT: "Listing Agreement Sent",
-                                STAGE_BLA_SIGNED: "Listing Agreement Signed",
-                            }.get(current_stage, current_stage)
-                            print(f"  {business}: ℹ️ BLA already sent/signed (stage: {stage_name})")
+                    if push_results["contact_matched"]:
+                        print(f"  {business}: ✅ Data pushed. BLA will send when opp is moved to 'Ready to Send BLA' stage.")
                     elif not push_results.get("seller_email"):
-                        print(f"  {business}: ⚠️ No seller email — BLA must be sent manually")
+                        print(f"  {business}: ⚠️ No seller email found in call data")
                 else:
                     print(f"  {business}: ⚠️ Could not fetch extraction data for GHL push")
 
