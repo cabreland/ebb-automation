@@ -56,6 +56,26 @@ SELLER_STAGE_ORDER = [
     "effd008a-aabb-48d9-95e3-7710ec785f03",              # 4  Listing Agreement Signed - Deal Won
 ]
 
+# ── Referred Deals Pipeline ─────────────────────────────────────────────
+REFERRED_PIPELINE_ID = "4fJYvwNAi6G2oHev8QPr"
+REFERRED_STAGE_REFERRED = "98645c59-8c71-45dc-adcc-ebb7040519f1"
+REFERRED_STAGE_DISCOVERY = "3699dd20-3c5d-41cf-b862-0002053bd4b1"
+REFERRED_STAGE_QUALIFIED = "f51c3a35-336c-4bba-8f66-7a8345f11e39"
+REFERRED_STAGE_ORDER = [
+    REFERRED_STAGE_REFERRED,                              # 0  Referred
+    REFERRED_STAGE_DISCOVERY,                             # 1  Discovery Scheduled
+    REFERRED_STAGE_QUALIFIED,                             # 2  Qualified
+    "08d6d35e-9fbb-46db-8339-3c128f1795bf",              # 3  Listing Agreement Sent
+    "956cc6b2-4797-4cc6-a2cb-33c011b1f2c1",              # 4  Listing Agreement Signed - Deal Won
+    "a91536a6-d967-43d3-b726-0ec5a14327d4",              # 5  Onboarding/Financials Requested
+]
+# Map pipeline_id → (stage_order, target_stage_on_approval)
+# On ✅ approval: advance to Qualified (discovery call already happened)
+PIPELINE_CONFIG = {
+    SELLER_PIPELINE_ID: (SELLER_STAGE_ORDER, STAGE_QUALIFIED),
+    REFERRED_PIPELINE_ID: (REFERRED_STAGE_ORDER, REFERRED_STAGE_QUALIFIED),
+}
+
 # ── GHL Custom Field IDs ────────────────────────────────────────────────
 CUSTOM_FIELDS = {
     "business_name": "JVlSWIjaE9Zw3Nm7WyUP",
@@ -377,22 +397,22 @@ async def auto_assign_contact(client: httpx.AsyncClient, contact_id: str, record
         return False
 
 
-async def advance_pipeline_stage(client: httpx.AsyncClient, contact_id: str, recorder_email: str,
-                                  target_stage: str = None) -> tuple[bool, str | None]:
-    """Find seller pipeline opp for this contact and advance to target stage.
-    
-    Returns (success, opp_id).
-    """
-    if target_stage is None:
-        target_stage = STAGE_QUALIFIED
-    ghl_user_id = EMAIL_TO_GHL_USER.get(recorder_email.lower().strip())
+async def _advance_opp_on_pipeline(
+    client: httpx.AsyncClient, pipeline_id: str, contact_id: str,
+    ghl_user_id: str | None,
+) -> tuple[bool, str | None]:
+    """Search one pipeline for opps and advance. Returns (found_and_handled, opp_id)."""
+    config = PIPELINE_CONFIG.get(pipeline_id)
+    if not config:
+        return False, None
+    stage_order, target_stage = config
 
     try:
         resp = await client.get(
             f"{GHL_API}/opportunities/search",
             params={
                 "location_id": LOCATION_ID,
-                "pipeline_id": SELLER_PIPELINE_ID,
+                "pipeline_id": pipeline_id,
                 "contact_id": contact_id,
                 "limit": "5",
             },
@@ -401,98 +421,106 @@ async def advance_pipeline_stage(client: httpx.AsyncClient, contact_id: str, rec
         )
         data = resp.json()
         opps = data.get("opportunities", [])
-
-        if not opps:
-            # Create opp if none exists
-            try:
-                create_body = {
-                    "pipelineId": SELLER_PIPELINE_ID,
-                    "locationId": LOCATION_ID,
-                    "name": "New Seller Lead",
-                    "pipelineStageId": target_stage,
-                    "contactId": contact_id,
-                    "status": "open",
-                }
-                if ghl_user_id:
-                    create_body["assignedTo"] = ghl_user_id
-
-                create_resp = await client.post(
-                    f"{GHL_API}/opportunities/",
-                    json=create_body,
-                    headers=_ghl_headers(),
-                    timeout=15,
-                )
-                if create_resp.status_code in (200, 201):
-                    opp_data = create_resp.json()
-                    opp_id = opp_data.get("opportunity", {}).get("id")
-                    print(f"    🆕 Created seller opp at target stage")
-                    return True, opp_id
-                else:
-                    print(f"    ⚠️ Opp creation returned {create_resp.status_code}: {create_resp.text[:200]}")
-                    return False, None
-            except Exception as e:
-                print(f"    ⚠️ Error creating opp: {e}")
-                return False, None
-
-        # Advance existing opp(s) — but never move backwards
-        for opp in opps:
-            opp_id = opp.get("id")
-            current_stage = opp.get("pipelineStageId")
-
-            # Don't move backwards
-            try:
-                current_idx = SELLER_STAGE_ORDER.index(current_stage)
-                target_idx = SELLER_STAGE_ORDER.index(target_stage)
-                if current_idx >= target_idx:
-                    stage_names = {
-                        STAGE_INTERESTED: "Interested",
-                        STAGE_DISCOVERY: "Discovery Call",
-                        STAGE_QUALIFIED: "Qualified",
-                    }
-                    current_name = stage_names.get(current_stage, current_stage[:12])
-                    print(f"    ⏭️ Opp {opp_id} already at '{current_name}' — skipping advance (won't move backwards)")
-                    # Still assign if needed
-                    if ghl_user_id:
-                        try:
-                            await client.put(
-                                f"{GHL_API}/opportunities/{opp_id}",
-                                json={"assignedTo": ghl_user_id},
-                                headers=_ghl_headers(),
-                                timeout=15,
-                            )
-                        except Exception:
-                            pass
-                    return True, opp_id
-            except ValueError:
-                pass
-
-            try:
-                update_body = {"pipelineStageId": target_stage}
-                if ghl_user_id:
-                    update_body["assignedTo"] = ghl_user_id
-
-                update_resp = await client.put(
-                    f"{GHL_API}/opportunities/{opp_id}",
-                    json=update_body,
-                    headers=_ghl_headers(),
-                    timeout=15,
-                )
-                if update_resp.status_code == 200:
-                    stage_name = {
-                        STAGE_DISCOVERY: "Discovery Call",
-                        STAGE_QUALIFIED: "Qualified",
-                    }.get(target_stage, target_stage[:12])
-                    print(f"    📈 Advanced opp {opp_id} → {stage_name}")
-                    return True, opp_id
-                else:
-                    print(f"    ⚠️ Opp advance returned {update_resp.status_code}: {update_resp.text[:200]}")
-            except Exception as e:
-                print(f"    ⚠️ Error advancing opp: {e}")
-
+    except Exception as e:
+        print(f"    ⚠️ Error searching pipeline {pipeline_id}: {e}")
         return False, None
 
+    if not opps:
+        return False, None  # No opp on this pipeline
+
+    for opp in opps:
+        opp_id = opp.get("id")
+        current_stage = opp.get("pipelineStageId")
+
+        # Don't move backwards
+        try:
+            current_idx = stage_order.index(current_stage)
+            target_idx = stage_order.index(target_stage)
+            if current_idx >= target_idx:
+                print(f"    ⏭️ Opp {opp_id} already at/past target — skipping advance")
+                if ghl_user_id:
+                    try:
+                        await client.put(
+                            f"{GHL_API}/opportunities/{opp_id}",
+                            json={"assignedTo": ghl_user_id},
+                            headers=_ghl_headers(),
+                            timeout=15,
+                        )
+                    except Exception:
+                        pass
+                return True, opp_id
+        except ValueError:
+            pass
+
+        try:
+            update_body = {"pipelineStageId": target_stage}
+            if ghl_user_id:
+                update_body["assignedTo"] = ghl_user_id
+
+            update_resp = await client.put(
+                f"{GHL_API}/opportunities/{opp_id}",
+                json=update_body,
+                headers=_ghl_headers(),
+                timeout=15,
+            )
+            if update_resp.status_code == 200:
+                print(f"    📈 Advanced opp {opp_id} → target stage on pipeline {pipeline_id[:8]}…")
+                return True, opp_id
+            else:
+                print(f"    ⚠️ Opp advance returned {update_resp.status_code}: {update_resp.text[:200]}")
+        except Exception as e:
+            print(f"    ⚠️ Error advancing opp: {e}")
+
+    return False, None
+
+
+async def advance_pipeline_stage(client: httpx.AsyncClient, contact_id: str, recorder_email: str) -> tuple[bool, str | None]:
+    """Find opp on Seller Pipeline OR Referred Deals and advance.
+    
+    Searches both pipelines. Creates a new Seller Pipeline opp if none exists anywhere.
+    Returns (success, opp_id).
+    """
+    ghl_user_id = EMAIL_TO_GHL_USER.get(recorder_email.lower().strip())
+
+    # Try Seller Pipeline first
+    found, opp_id = await _advance_opp_on_pipeline(client, SELLER_PIPELINE_ID, contact_id, ghl_user_id)
+    if found:
+        return True, opp_id
+
+    # Try Referred Deals
+    found, opp_id = await _advance_opp_on_pipeline(client, REFERRED_PIPELINE_ID, contact_id, ghl_user_id)
+    if found:
+        return True, opp_id
+
+    # No opp on either pipeline — create on Seller Pipeline
+    try:
+        create_body = {
+            "pipelineId": SELLER_PIPELINE_ID,
+            "locationId": LOCATION_ID,
+            "name": "New Seller Lead",
+            "pipelineStageId": STAGE_QUALIFIED,
+            "contactId": contact_id,
+            "status": "open",
+        }
+        if ghl_user_id:
+            create_body["assignedTo"] = ghl_user_id
+
+        create_resp = await client.post(
+            f"{GHL_API}/opportunities/",
+            json=create_body,
+            headers=_ghl_headers(),
+            timeout=15,
+        )
+        if create_resp.status_code in (200, 201):
+            opp_data = create_resp.json()
+            opp_id = opp_data.get("opportunity", {}).get("id")
+            print(f"    🆕 Created seller opp at Qualified stage")
+            return True, opp_id
+        else:
+            print(f"    ⚠️ Opp creation returned {create_resp.status_code}: {create_resp.text[:200]}")
+            return False, None
     except Exception as e:
-        print(f"    ⚠️ Error searching opps: {e}")
+        print(f"    ⚠️ Error creating opp: {e}")
         return False, None
 
 
@@ -544,8 +572,8 @@ async def push_to_ghl(client: httpx.AsyncClient, extraction_id: str, extraction:
     # 4. Auto-assign to recorder
     results["assigned"] = await auto_assign_contact(client, contact_id, recorder_email)
 
-    # 5. Advance pipeline stage to Qualified (discovery call already happened)
-    advanced, _ = await advance_pipeline_stage(client, contact_id, recorder_email, STAGE_QUALIFIED)
+    # 5. Advance pipeline stage (searches Seller + Referred Deals)
+    advanced, _ = await advance_pipeline_stage(client, contact_id, recorder_email)
     results["stage_advanced"] = advanced
 
     return results
