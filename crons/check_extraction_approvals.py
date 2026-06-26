@@ -8,9 +8,9 @@ On approval:
   3. Push call summary to GHL contact notes
   4. Auto-assign contact/opp to whoever recorded the call
   5. Advance seller pipeline opp → "Qualified" stage (discovery call already happened)
-  6. Auto-send BLA via BoldSign (if contact has required fields)
-  7. Store BoldSign document ID in GHL
-  8. Advance pipeline → "Listing Agreement Sent"
+
+BLA send is decoupled — fires only when a human moves the opp to
+"Listing Agreement Sent" stage in the Seller Pipeline.
 
 Runs as a script cron every 5 minutes.
 
@@ -19,25 +19,27 @@ Usage:
 """
 import asyncio
 import json
+import os
 import sys
 
 sys.path.insert(0, "/work")
 import httpx
 from sdk.tools.slack_admin_tools import coworker_get_slack_reactions, coworker_list_slack_users
-from sdk.tools.pd_highlevel_oauth import (
-    pd_highlevel_oauth_proxy_get,
-    pd_highlevel_oauth_proxy_post,
-    pd_highlevel_oauth_proxy_put,
-    pd_highlevel_oauth_upsert_contact,
-    pd_highlevel_oauth_update_contact,
-)
 from sdk.tools.viktor_spaces_tools import query_app_database
 
 SYNC_URL = "https://energetic-antelope-119.convex.site/api/viktor-sync"
 SYNC_SECRET = "ebb-sync-k7X9mP2vQ4nR8wL1"
 LOCATION_ID = "VrIFtlCW5GvoCpf0Spte"
 GHL_API = "https://services.leadconnectorhq.com"
-GHL_HEADERS = {"Version": "2021-07-28"}
+GHL_PIT_KEY = os.environ.get("GHL_PIT_KEY", "pit-216d7602-3cd8-4aee-9a59-a378beea9537")
+
+def _ghl_headers() -> dict:
+    """Standard headers for direct GHL PIT-key API calls."""
+    return {
+        "Authorization": f"Bearer {GHL_PIT_KEY}",
+        "Version": "2021-07-28",
+        "Content-Type": "application/json",
+    }
 
 # ── Seller Pipeline ──────────────────────────────────────────────────────
 SELLER_PIPELINE_ID = "Pj4Z15z4bAywO3GIC0u3"
@@ -53,9 +55,6 @@ SELLER_STAGE_ORDER = [
     "3f233619-1714-4a45-9fa6-7319ca3dd663",              # 3  Listing Agreement Sent
     "effd008a-aabb-48d9-95e3-7710ec785f03",              # 4  Listing Agreement Signed - Deal Won
 ]
-# BLA send is decoupled from this script.
-# It fires via a separate event-driven trigger when a human moves
-# the opp to "Ready to Send BLA" stage in the Seller Pipeline.
 
 # ── GHL Custom Field IDs ────────────────────────────────────────────────
 CUSTOM_FIELDS = {
@@ -67,8 +66,6 @@ CUSTOM_FIELDS = {
     "ebitda": "Ip3xl0jFghpFjxJraQpK",
     "purchase_price": "x4zFeTQonNTUPMBNU6Pf",
 }
-# Set after GHL field creation (populated at runtime)
-# BOLDSIGN_DOC_ID_FIELD is handled by the BLA send script, not this approval flow
 
 # ── Fathom recorder email → GHL user ID ─────────────────────────────────
 EMAIL_TO_GHL_USER = {
@@ -156,7 +153,7 @@ async def reject_extraction(extraction_id: str, reviewer_name: str, note: str = 
 
 
 # ─────────────────────────────────────────────────────────────────────────
-# GHL PUSH PIPELINE (fires on approval)
+# GHL PUSH PIPELINE — Direct httpx calls with PIT key
 # ─────────────────────────────────────────────────────────────────────────
 
 def _extract_seller_email(recording: dict) -> str | None:
@@ -170,7 +167,6 @@ def _extract_seller_email(recording: dict) -> str | None:
             email = inv.get("email", "").lower().strip()
             if not email:
                 continue
-            # Skip internal EBB team emails
             if email.endswith("@exclusivebusinessbrokers.com"):
                 continue
             if email.endswith("@highincomesociety.com"):
@@ -181,21 +177,17 @@ def _extract_seller_email(recording: dict) -> str | None:
     return None
 
 
-async def find_or_create_contact(seller_email: str, seller_name: str | None) -> str | None:
+async def find_or_create_contact(client: httpx.AsyncClient, seller_email: str, seller_name: str | None) -> str | None:
     """Search GHL for a contact by email, create if not found. Return contactId."""
-    # Search by email
     try:
-        result = await pd_highlevel_oauth_proxy_get(
-            url=f"{GHL_API}/contacts/",
-            query_params={
-                "locationId": LOCATION_ID,
-                "query": seller_email,
-            },
-            headers=GHL_HEADERS,
+        resp = await client.get(
+            f"{GHL_API}/contacts/",
+            params={"locationId": LOCATION_ID, "query": seller_email},
+            headers=_ghl_headers(),
+            timeout=15,
         )
-        parsed = json.loads(result.get("content", "{}"))
-        body = parsed.get("body", parsed)
-        contacts = body.get("contacts", [])
+        data = resp.json()
+        contacts = data.get("contacts", [])
 
         if contacts:
             contact_id = contacts[0].get("id")
@@ -205,18 +197,25 @@ async def find_or_create_contact(seller_email: str, seller_name: str | None) -> 
     except Exception as e:
         print(f"    ⚠️ Error searching contacts: {e}")
 
-    # Not found — create
+    # Not found — create via upsert
     if seller_name:
         try:
-            result = await pd_highlevel_oauth_upsert_contact(
-                locationId=LOCATION_ID,
-                name=seller_name,
-                email=seller_email,
+            parts = seller_name.split(" ", 1)
+            body = {
+                "locationId": LOCATION_ID,
+                "email": seller_email,
+                "firstName": parts[0],
+                "lastName": parts[1] if len(parts) > 1 else "",
+                "source": "Viktor Automation",
+            }
+            resp = await client.post(
+                f"{GHL_API}/contacts/upsert",
+                json=body,
+                headers=_ghl_headers(),
+                timeout=15,
             )
-            content = result.get("content", "{}")
-            parsed = json.loads(content) if isinstance(content, str) else content
-            body = parsed.get("body", parsed)
-            contact = body.get("contact", body)
+            data = resp.json()
+            contact = data.get("contact", {})
             contact_id = contact.get("id")
             if contact_id:
                 print(f"    ✨ Created GHL contact: {seller_name} ({contact_id})")
@@ -227,11 +226,10 @@ async def find_or_create_contact(seller_email: str, seller_name: str | None) -> 
     return None
 
 
-async def push_custom_fields(contact_id: str, extraction: dict) -> bool:
+async def push_custom_fields(client: httpx.AsyncClient, contact_id: str, extraction: dict) -> bool:
     """Push extracted fields to GHL contact custom fields."""
     custom_field_values = []
 
-    # Map extraction fields → GHL custom field IDs
     mappings = [
         ("legalBusinessName", "business_name"),
         ("businessWebsite", "business_website"),
@@ -269,18 +267,24 @@ async def push_custom_fields(contact_id: str, extraction: dict) -> bool:
         return True
 
     try:
-        await pd_highlevel_oauth_update_contact(
-            contactId=contact_id,
-            additionalOptions={"customFields": custom_field_values},
+        resp = await client.put(
+            f"{GHL_API}/contacts/{contact_id}",
+            json={"customFields": custom_field_values},
+            headers=_ghl_headers(),
+            timeout=15,
         )
-        print(f"    📦 Pushed {len(custom_field_values)} custom fields to GHL")
-        return True
+        if resp.status_code == 200:
+            print(f"    📦 Pushed {len(custom_field_values)} custom fields to GHL")
+            return True
+        else:
+            print(f"    ⚠️ Custom fields push returned {resp.status_code}: {resp.text[:200]}")
+            return False
     except Exception as e:
         print(f"    ⚠️ Error pushing custom fields: {e}")
         return False
 
 
-async def push_contact_notes(contact_id: str, extraction: dict, recording: dict) -> bool:
+async def push_contact_notes(client: httpx.AsyncClient, contact_id: str, extraction: dict, recording: dict) -> bool:
     """Push call summary and key details to GHL contact notes."""
     parts = []
 
@@ -331,19 +335,24 @@ async def push_contact_notes(contact_id: str, extraction: dict, recording: dict)
     note_body = "\n".join(parts)
 
     try:
-        await pd_highlevel_oauth_proxy_post(
-            url=f"{GHL_API}/contacts/{contact_id}/notes",
-            json_body={"body": note_body, "userId": None},
-            headers=GHL_HEADERS,
+        resp = await client.post(
+            f"{GHL_API}/contacts/{contact_id}/notes",
+            json={"body": note_body},
+            headers=_ghl_headers(),
+            timeout=15,
         )
-        print(f"    📝 Pushed call notes to GHL contact")
-        return True
+        if resp.status_code in (200, 201):
+            print(f"    📝 Pushed call notes to GHL contact")
+            return True
+        else:
+            print(f"    ⚠️ Notes push returned {resp.status_code}: {resp.text[:200]}")
+            return False
     except Exception as e:
         print(f"    ⚠️ Error pushing notes: {e}")
         return False
 
 
-async def auto_assign_contact(contact_id: str, recorder_email: str) -> bool:
+async def auto_assign_contact(client: httpx.AsyncClient, contact_id: str, recorder_email: str) -> bool:
     """Assign the GHL contact to whoever recorded the call."""
     ghl_user_id = EMAIL_TO_GHL_USER.get(recorder_email.lower().strip())
     if not ghl_user_id:
@@ -351,41 +360,47 @@ async def auto_assign_contact(contact_id: str, recorder_email: str) -> bool:
         return False
 
     try:
-        await pd_highlevel_oauth_update_contact(
-            contactId=contact_id,
-            additionalOptions={"assignedTo": ghl_user_id},
+        resp = await client.put(
+            f"{GHL_API}/contacts/{contact_id}",
+            json={"assignedTo": ghl_user_id},
+            headers=_ghl_headers(),
+            timeout=15,
         )
-        print(f"    👤 Assigned contact to GHL user {ghl_user_id} ({recorder_email})")
-        return True
+        if resp.status_code == 200:
+            print(f"    👤 Assigned contact to GHL user {ghl_user_id} ({recorder_email})")
+            return True
+        else:
+            print(f"    ⚠️ Assign returned {resp.status_code}: {resp.text[:200]}")
+            return False
     except Exception as e:
         print(f"    ⚠️ Error assigning contact: {e}")
         return False
 
 
-async def advance_pipeline_stage(contact_id: str, recorder_email: str,
+async def advance_pipeline_stage(client: httpx.AsyncClient, contact_id: str, recorder_email: str,
                                   target_stage: str = None) -> tuple[bool, str | None]:
     """Find seller pipeline opp for this contact and advance to target stage.
     
     Returns (success, opp_id).
     """
     if target_stage is None:
-        target_stage = STAGE_DISCOVERY
+        target_stage = STAGE_QUALIFIED
     ghl_user_id = EMAIL_TO_GHL_USER.get(recorder_email.lower().strip())
 
     try:
-        result = await pd_highlevel_oauth_proxy_get(
-            url=f"{GHL_API}/opportunities/search",
-            query_params={
+        resp = await client.get(
+            f"{GHL_API}/opportunities/search",
+            params={
                 "location_id": LOCATION_ID,
                 "pipeline_id": SELLER_PIPELINE_ID,
                 "contact_id": contact_id,
                 "limit": "5",
             },
-            headers=GHL_HEADERS,
+            headers=_ghl_headers(),
+            timeout=15,
         )
-        parsed = json.loads(result.get("content", "{}"))
-        body = parsed.get("body", parsed)
-        opps = body.get("opportunities", [])
+        data = resp.json()
+        opps = data.get("opportunities", [])
 
         if not opps:
             # Create opp if none exists
@@ -401,16 +416,20 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
                 if ghl_user_id:
                     create_body["assignedTo"] = ghl_user_id
 
-                create_result = await pd_highlevel_oauth_proxy_post(
-                    url=f"{GHL_API}/opportunities/",
-                    json_body=create_body,
-                    headers=GHL_HEADERS,
+                create_resp = await client.post(
+                    f"{GHL_API}/opportunities/",
+                    json=create_body,
+                    headers=_ghl_headers(),
+                    timeout=15,
                 )
-                create_parsed = json.loads(create_result.get("content", "{}"))
-                create_body_resp = create_parsed.get("body", create_parsed)
-                opp_id = create_body_resp.get("opportunity", {}).get("id")
-                print(f"    🆕 Created seller opp at target stage")
-                return True, opp_id
+                if create_resp.status_code in (200, 201):
+                    opp_data = create_resp.json()
+                    opp_id = opp_data.get("opportunity", {}).get("id")
+                    print(f"    🆕 Created seller opp at target stage")
+                    return True, opp_id
+                else:
+                    print(f"    ⚠️ Opp creation returned {create_resp.status_code}: {create_resp.text[:200]}")
+                    return False, None
             except Exception as e:
                 print(f"    ⚠️ Error creating opp: {e}")
                 return False, None
@@ -420,7 +439,7 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
             opp_id = opp.get("id")
             current_stage = opp.get("pipelineStageId")
 
-            # Don't move backwards — if opp is already at or past target, skip
+            # Don't move backwards
             try:
                 current_idx = SELLER_STAGE_ORDER.index(current_stage)
                 target_idx = SELLER_STAGE_ORDER.index(target_stage)
@@ -435,16 +454,16 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
                     # Still assign if needed
                     if ghl_user_id:
                         try:
-                            await pd_highlevel_oauth_proxy_put(
-                                url=f"{GHL_API}/opportunities/{opp_id}",
-                                json_body={"assignedTo": ghl_user_id},
-                                headers=GHL_HEADERS,
+                            await client.put(
+                                f"{GHL_API}/opportunities/{opp_id}",
+                                json={"assignedTo": ghl_user_id},
+                                headers=_ghl_headers(),
+                                timeout=15,
                             )
                         except Exception:
                             pass
                     return True, opp_id
             except ValueError:
-                # Stage not in our ordering list — proceed with advance
                 pass
 
             try:
@@ -452,17 +471,21 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
                 if ghl_user_id:
                     update_body["assignedTo"] = ghl_user_id
 
-                await pd_highlevel_oauth_proxy_put(
-                    url=f"{GHL_API}/opportunities/{opp_id}",
-                    json_body=update_body,
-                    headers=GHL_HEADERS,
+                update_resp = await client.put(
+                    f"{GHL_API}/opportunities/{opp_id}",
+                    json=update_body,
+                    headers=_ghl_headers(),
+                    timeout=15,
                 )
-                stage_name = {
-                    STAGE_DISCOVERY: "Discovery Call",
-                    STAGE_QUALIFIED: "Qualified",
-                }.get(target_stage, target_stage[:12])
-                print(f"    📈 Advanced opp {opp_id} → {stage_name}")
-                return True, opp_id
+                if update_resp.status_code == 200:
+                    stage_name = {
+                        STAGE_DISCOVERY: "Discovery Call",
+                        STAGE_QUALIFIED: "Qualified",
+                    }.get(target_stage, target_stage[:12])
+                    print(f"    📈 Advanced opp {opp_id} → {stage_name}")
+                    return True, opp_id
+                else:
+                    print(f"    ⚠️ Opp advance returned {update_resp.status_code}: {update_resp.text[:200]}")
             except Exception as e:
                 print(f"    ⚠️ Error advancing opp: {e}")
 
@@ -473,11 +496,10 @@ async def advance_pipeline_stage(contact_id: str, recorder_email: str,
         return False, None
 
 
-async def push_to_ghl(extraction_id: str, extraction: dict, recording: dict) -> dict:
+async def push_to_ghl(client: httpx.AsyncClient, extraction_id: str, extraction: dict, recording: dict) -> dict:
     """
     Full GHL push pipeline — runs after extraction is approved.
-
-    Returns dict with results for each step + contact_id and seller_email.
+    Uses direct httpx calls with PIT key (no OAuth proxy drafts).
     """
     results = {
         "contact_matched": False,
@@ -503,7 +525,7 @@ async def push_to_ghl(extraction_id: str, extraction: dict, recording: dict) -> 
             print(f"    ❌ Cannot match to GHL contact — no email and no ghlContactId")
             return results
     else:
-        contact_id = await find_or_create_contact(seller_email, seller_name)
+        contact_id = await find_or_create_contact(client, seller_email, seller_name)
 
     if not contact_id:
         print(f"    ❌ Could not match/create GHL contact")
@@ -513,17 +535,17 @@ async def push_to_ghl(extraction_id: str, extraction: dict, recording: dict) -> 
     results["contact_id"] = contact_id
     results["seller_email"] = seller_email
 
-    # 3. Push custom fields
-    results["fields_pushed"] = await push_custom_fields(contact_id, extraction)
+    # 2. Push custom fields
+    results["fields_pushed"] = await push_custom_fields(client, contact_id, extraction)
 
-    # 4. Push call notes
-    results["notes_pushed"] = await push_contact_notes(contact_id, extraction, recording)
+    # 3. Push call notes
+    results["notes_pushed"] = await push_contact_notes(client, contact_id, extraction, recording)
 
-    # 5. Auto-assign to recorder
-    results["assigned"] = await auto_assign_contact(contact_id, recorder_email)
+    # 4. Auto-assign to recorder
+    results["assigned"] = await auto_assign_contact(client, contact_id, recorder_email)
 
-    # 6. Advance pipeline stage to Qualified (discovery call already happened)
-    advanced, _ = await advance_pipeline_stage(contact_id, recorder_email, STAGE_QUALIFIED)
+    # 5. Advance pipeline stage to Qualified (discovery call already happened)
+    advanced, _ = await advance_pipeline_stage(client, contact_id, recorder_email, STAGE_QUALIFIED)
     results["stage_advanced"] = advanced
 
     return results
@@ -573,7 +595,7 @@ async def main():
                         "white_check_mark::skin-tone-3", "white_check_mark::skin-tone-4",
                         "white_check_mark::skin-tone-5") and users:
                 approved = True
-                reviewer_id = users[0]  # First person to react
+                reviewer_id = users[0]
             elif name in ("x", "negative_squared_cross_mark", "no_entry_sign") and users:
                 rejected = True
                 reviewer_id = users[0]
@@ -585,20 +607,29 @@ async def main():
             print(f"  {business}: {status} by {reviewer_name}")
 
             if success:
-                # Fetch full extraction + recording data for GHL push
                 full_data = await get_extraction_with_recording(ext_id)
                 if full_data:
                     recording = full_data.get("recording", {})
 
-                    # Push to GHL (fields + notes + assign + stage advance ONLY)
-                    # BLA send is NOT triggered here — it's decoupled and fires
-                    # only when a human moves the opp to "Ready to Send BLA" stage
-                    push_results = await push_to_ghl(ext_id, full_data, recording)
+                    # Push to GHL with a shared httpx client
+                    async with httpx.AsyncClient() as ghl_client:
+                        push_results = await push_to_ghl(ghl_client, ext_id, full_data, recording)
+
                     ghl_status = "✅" if push_results["contact_matched"] else "⚠️ PARTIAL"
                     print(f"  {business}: GHL push {ghl_status}")
 
                     if push_results["contact_matched"]:
-                        print(f"  {business}: ✅ Data pushed. BLA will send when opp is moved to 'Ready to Send BLA' stage.")
+                        # Log actual outcomes
+                        outcomes = []
+                        if push_results["fields_pushed"]:
+                            outcomes.append("fields")
+                        if push_results["notes_pushed"]:
+                            outcomes.append("notes")
+                        if push_results["assigned"]:
+                            outcomes.append("assigned")
+                        if push_results["stage_advanced"]:
+                            outcomes.append("stage")
+                        print(f"  {business}: ✅ Pushed: {', '.join(outcomes)}. BLA sends on stage move.")
                     elif not push_results.get("seller_email"):
                         print(f"  {business}: ⚠️ No seller email found in call data")
                 else:
