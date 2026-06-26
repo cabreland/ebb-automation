@@ -1,23 +1,34 @@
 """
-Process BoldSign "Completed" webhook events → trigger seller onboarding.
+Signed BLA Follow-On Processor
+================================
+Picks up BoldSign events marked `ghl_updated` by the instant processor
+and handles the follow-on work:
 
-Reads unprocessed events from Convex (stored by the BoldSign webhook handler)
-and for each:
-  1. Match BoldSign document ID → GHL contact via custom field
-  2. Advance GHL pipeline → "Listing Agreement Signed - Deal Won"
-  3. Download the signed BLA PDF
-  4. Run seller onboarding (data room + portal sync)
-  5. Store signed BLA in data room "07 — Listing Agreement" folder
-  6. Mark event as processed
+  1. Create Google Drive data room (9 folders + self-help guides)
+  2. Download the signed BLA PDF from BoldSign
+  3. Upload signed BLA to data room "07 — Listing Agreement" folder
+  4. Update GHL contact with drive_folder_id
+  5. Add GHL onboarding note with data room link
+  6. Sync portal with deal + folder mapping
+  7. Mark event as `processed`
 
-The BoldSign webhook fires instantly on completion. This cron picks up
-events within ~1 min (condition-based: only runs when pending events exist).
+The instant processor (Convex `processSignedBla`) already handles:
+  - Pipeline advance → "Listing Agreement Signed"
+  - BoldSign doc ID → GHL custom field
+  - Confirmation note → GHL
+  - Portal stage sync
+
+This script handles everything that requires Google Drive access.
+
+Triggered by condition: has_ghl_updated_boldsign_events.py
+Cron: /boldsign/check-signatures (every 2 min, condition-gated)
 
 Usage:
     uv run python skills/deal_management/scripts/check_bla_signatures.py
 """
 import asyncio
 import json
+import re
 import sys
 from datetime import datetime
 
@@ -26,7 +37,14 @@ import httpx
 from sdk.tools.pd_boldsign import pd_boldsign_proxy_get
 from sdk.tools.pd_highlevel_oauth import (
     pd_highlevel_oauth_proxy_get,
-    pd_highlevel_oauth_proxy_put,
+    pd_highlevel_oauth_update_contact,
+    pd_highlevel_oauth_proxy_post,
+)
+from sdk.tools.gdrive import (
+    gdrive_create_folder,
+    gdrive_google_docs_create,
+    gdrive_move,
+    gdrive_upload_file,
 )
 
 # ── Config ───────────────────────────────────────────────────────────────
@@ -37,45 +55,57 @@ LOCATION_ID = "VrIFtlCW5GvoCpf0Spte"
 GHL_API = "https://services.leadconnectorhq.com"
 GHL_HEADERS = {"Version": "2021-07-28"}
 
-SELLER_PIPELINE_ID = "Pj4Z15z4bAywO3GIC0u3"
-STAGE_BLA_SENT = "3f233619-1714-4a45-9fa6-7319ca3dd663"
-STAGE_BLA_SIGNED = "effd008a-aabb-48d9-95e3-7710ec785f03"
-
-# Custom field IDs — loaded from config at runtime
-BOLDSIGN_DOC_ID_FIELD = None
+PENDING_DEALS_FOLDER = "1PznxONg94CN2wJuUjZmcIRMkgYWr0b60"
 DRIVE_FOLDER_ID_FIELD = "HfAcPqekpJecfIm0G15Z"
+BOLDSIGN_DOC_ID_FIELD = "h00EbkYqD1xL16dtagDs"
+BUSINESS_NAME_FIELD = "JVlSWIjaE9Zw3Nm7WyUP"
+
+# 9-folder data room structure
+SUBFOLDER_NAMES = [
+    "01 — Financials",
+    "02 — Org Structure",
+    "03 — Operations",
+    "04 — Legal & Assets",
+    "05 — Marketing & Analytics",
+    "06 — Signed NDA",
+    "07 — Listing Agreement",
+    "08 — LOI",
+    "09 — Data Room (buyer-facing)",
+]
+
+GUIDE_CONTENT = {
+    "01 — Financials": "📋 WHAT GOES HERE — Financials\n\nPRIORITY — Upload First\n\n✅ Tax Returns — last 3 years\n✅ Monthly P&L — trailing 12 months\n✅ Year-End P&L — last 3 full fiscal years\n✅ Current Balance Sheet\n\nFormat: PDF for tax docs. Excel/CSV for P&L.",
+    "02 — Org Structure": "📋 WHAT GOES HERE — Org Structure\n\nPRIORITY — Upload Alongside Financials\n\n✅ Org Chart — names, roles, reporting lines\n✅ Employee/Contractor Roster\n✅ Key person dependencies",
+    "03 — Operations": "📋 WHAT GOES HERE — Operations\n\n• Business Description / Overview\n• Customer & Revenue Concentration\n• Vendor / Supplier Contracts\n• Technology stack\n• SOPs / Process documentation",
+    "04 — Legal & Assets": "📋 WHAT GOES HERE — Legal & Assets\n\n• IP — trademarks, patents, domains\n• Lease / Rental Agreements\n• Corporate docs\n• Insurance\n• Pending or past litigation",
+    "05 — Marketing & Analytics": "📋 WHAT GOES HERE — Marketing & Analytics\n\n• Website analytics — 12-month trend\n• Marketing channel breakdown\n• Social metrics\n• Ad spend + ROAS\n• Email list size + engagement",
+    "06 — Signed NDA": "📋 WHAT GOES HERE — Signed NDA\n\nNDAs are auto-filed here. No action needed.",
+    "07 — Listing Agreement": "📋 WHAT GOES HERE — Listing Agreement\n\nYour signed listing agreement is stored here automatically.",
+    "08 — LOI": "📋 WHAT GOES HERE — LOI\n\nLetters of Intent are filed here when received.",
+    "09 — Data Room (buyer-facing)": "📋 WHAT GOES HERE — Data Room (Buyer-Facing)\n\n⚠️ DO NOT UPLOAD FILES DIRECTLY. Assembled by EBB team after docs in 01–05 are reviewed.",
+}
 
 
-def load_config():
-    """Load GHL config including BoldSign doc ID field."""
-    global BOLDSIGN_DOC_ID_FIELD
-    try:
-        with open("/work/skills/deal_management/references/ghl_config.json") as f:
-            config = json.load(f)
-            BOLDSIGN_DOC_ID_FIELD = config.get("boldsign_document_id_field")
-    except (FileNotFoundError, json.JSONDecodeError):
-        pass
+# ── Convex API ───────────────────────────────────────────────────────────
 
-
-async def get_pending_events() -> list[dict]:
-    """Get unprocessed BoldSign webhook events from Convex."""
+async def get_ghl_updated_events() -> list[dict]:
+    """Get BoldSign events at ghl_updated status (data room pending)."""
     async with httpx.AsyncClient() as client:
         resp = await client.post(
             SYNC_URL,
-            json={"action": "get_pending_boldsign_events"},
+            json={"action": "get_ghl_updated_boldsign_events"},
             headers={"Authorization": f"Bearer {SYNC_SECRET}"},
             timeout=15,
         )
         if resp.status_code == 200:
-            data = resp.json()
-            return data.get("data", [])
+            return resp.json().get("data", [])
     return []
 
 
 async def mark_event_processed(event_id: str, ghl_contact_id: str = None,
                                 deal_id: str = None, result: str = None,
                                 error: str = None):
-    """Mark a BoldSign event as processed in Convex."""
+    """Mark a BoldSign event as fully processed in Convex."""
     async with httpx.AsyncClient() as client:
         await client.post(
             SYNC_URL,
@@ -92,221 +122,244 @@ async def mark_event_processed(event_id: str, ghl_contact_id: str = None,
         )
 
 
-async def find_contact_by_boldsign_doc(document_id: str) -> dict | None:
-    """Search GHL contacts for one with matching BoldSign Document ID."""
-    if not BOLDSIGN_DOC_ID_FIELD:
-        return None
+# ── GHL Helpers ──────────────────────────────────────────────────────────
 
+async def get_contact_by_doc_id(document_id: str) -> dict | None:
+    """Find GHL contact that has this BoldSign document ID in custom field."""
     try:
-        # Search all opps at "Listing Agreement Sent" stage
+        # Search contacts with this BoldSign doc ID
         result = await pd_highlevel_oauth_proxy_get(
-            url=f"{GHL_API}/opportunities/search",
-            query_params={
-                "location_id": LOCATION_ID,
-                "pipeline_id": SELLER_PIPELINE_ID,
-                "pipeline_stage_id": STAGE_BLA_SENT,
-                "limit": "50",
-            },
+            url=f"{GHL_API}/contacts/",
+            query_params={"locationId": LOCATION_ID, "query": document_id},
             headers=GHL_HEADERS,
         )
         parsed = json.loads(result.get("content", "{}"))
         body = parsed.get("body", parsed)
-        opps = body.get("opportunities", [])
+        contacts = body.get("contacts", [])
 
-        for opp in opps:
-            contact_id = opp.get("contactId") or opp.get("contact", {}).get("id")
-            if not contact_id:
-                continue
-
-            # Check custom field
-            contact_result = await pd_highlevel_oauth_proxy_get(
-                url=f"{GHL_API}/contacts/{contact_id}",
-                headers=GHL_HEADERS,
-            )
-            c_parsed = json.loads(contact_result.get("content", "{}"))
-            c_body = c_parsed.get("body", c_parsed)
-            contact = c_body.get("contact", c_body)
-
+        # Check each contact's custom fields
+        for contact in contacts:
             for cf in contact.get("customFields", []):
                 if cf.get("id") == BOLDSIGN_DOC_ID_FIELD and cf.get("value") == document_id:
-                    return {
-                        "contact_id": contact_id,
-                        "contact": contact,
-                        "opp_id": opp.get("id"),
-                        "opp_name": opp.get("name"),
-                    }
+                    return contact
     except Exception as e:
-        print(f"    ⚠️ Error searching for contact: {e}")
+        print(f"    ⚠️ Error searching by doc ID: {e}")
     return None
 
 
-async def find_contact_from_boldsign_details(document_id: str) -> dict | None:
-    """Fallback: get signer email from BoldSign doc, search GHL by email."""
+async def get_contact_by_email(email: str) -> dict | None:
+    """Search GHL for contact by email."""
+    try:
+        result = await pd_highlevel_oauth_proxy_get(
+            url=f"{GHL_API}/contacts/",
+            query_params={"locationId": LOCATION_ID, "query": email},
+            headers=GHL_HEADERS,
+        )
+        parsed = json.loads(result.get("content", "{}"))
+        body = parsed.get("body", parsed)
+        contacts = body.get("contacts", [])
+        if contacts:
+            return contacts[0]
+    except Exception as e:
+        print(f"    ⚠️ Error searching by email: {e}")
+    return None
+
+
+async def get_signer_email(document_id: str) -> str | None:
+    """Get seller's email from BoldSign document details."""
     try:
         result = await pd_boldsign_proxy_get(
             f"https://api.boldsign.com/v1/document/properties?documentId={document_id}"
         )
         parsed = json.loads(result.get("content", "{}"))
         body = parsed.get("body", parsed)
-
         for signer in body.get("signerDetails", []):
-            role = signer.get("signerRole", "")
-            if role.lower() == "seller":
-                email = signer.get("signerEmail", "")
-                if email:
-                    # Search GHL by email
-                    search_result = await pd_highlevel_oauth_proxy_get(
-                        url=f"{GHL_API}/contacts/",
-                        query_params={
-                            "locationId": LOCATION_ID,
-                            "query": email,
-                        },
-                        headers=GHL_HEADERS,
-                    )
-                    s_parsed = json.loads(search_result.get("content", "{}"))
-                    s_body = s_parsed.get("body", s_parsed)
-                    contacts = s_body.get("contacts", [])
-                    if contacts:
-                        contact_id = contacts[0].get("id")
-                        contact_name = contacts[0].get("name", "")
-
-                        # Find their opp
-                        opp_result = await pd_highlevel_oauth_proxy_get(
-                            url=f"{GHL_API}/opportunities/search",
-                            query_params={
-                                "location_id": LOCATION_ID,
-                                "pipeline_id": SELLER_PIPELINE_ID,
-                                "contact_id": contact_id,
-                                "limit": "1",
-                            },
-                            headers=GHL_HEADERS,
-                        )
-                        o_parsed = json.loads(opp_result.get("content", "{}"))
-                        o_body = o_parsed.get("body", o_parsed)
-                        opps = o_body.get("opportunities", [])
-
-                        return {
-                            "contact_id": contact_id,
-                            "contact": contacts[0],
-                            "opp_id": opps[0].get("id") if opps else None,
-                            "opp_name": opps[0].get("name") if opps else contact_name,
-                        }
+            if signer.get("signerRole", "").lower() == "seller":
+                return signer.get("signerEmail")
     except Exception as e:
-        print(f"    ⚠️ Error getting BoldSign doc details: {e}")
+        print(f"    ⚠️ Error getting signer email: {e}")
     return None
 
 
-async def advance_to_signed(opp_id: str) -> bool:
-    """Advance opportunity to Listing Agreement Signed stage."""
-    try:
-        await pd_highlevel_oauth_proxy_put(
-            url=f"{GHL_API}/opportunities/{opp_id}",
-            json_body={"pipelineStageId": STAGE_BLA_SIGNED},
-            headers=GHL_HEADERS,
-        )
-        print(f"    📈 Advanced opp → Listing Agreement Signed")
-        return True
-    except Exception as e:
-        print(f"    ⚠️ Error advancing opp: {e}")
-        return False
+def get_company_name(contact: dict) -> str:
+    """Extract company name from contact (companyName or business_name custom field)."""
+    name = contact.get("companyName", "")
+    if not name:
+        for cf in contact.get("customFields", []):
+            if cf.get("id") == BUSINESS_NAME_FIELD:
+                name = cf.get("value", "")
+                break
+    return name or "Unknown Business"
 
 
-async def run_seller_onboarding(contact_id: str) -> dict:
-    """Run the seller onboarding pipeline (data room + portal sync)."""
-    try:
-        from skills.deal_management.scripts.seller_onboarding import onboard_seller
-        result = await onboard_seller(contact_id)
-        return result or {}
-    except Exception as e:
-        print(f"    ❌ Onboarding failed: {e}")
-        return {"error": str(e)}
+# ── Data Room Creation ───────────────────────────────────────────────────
 
+async def create_data_room(company_name: str) -> dict:
+    """Create 9-folder data room in Pending/Inactive Deals. Returns folder IDs."""
+    print(f"    📁 Creating data room: {company_name}/")
+
+    # Create parent folder
+    result = await gdrive_create_folder(name=company_name, parent_path=PENDING_DEALS_FOLDER)
+    parent_id = result.get("folder_id")
+    if not parent_id:
+        raise RuntimeError(f"Failed to create parent folder: {result}")
+    print(f"    ✅ Parent folder created ({parent_id})")
+
+    # Create 9 subfolders
+    subfolder_ids = {}
+    for name in SUBFOLDER_NAMES:
+        sub = await gdrive_create_folder(name=name, parent_path=parent_id)
+        sub_id = sub.get("folder_id")
+        if not sub_id:
+            print(f"    ⚠️ Failed to create {name}")
+            continue
+        subfolder_ids[name] = sub_id
+        print(f"      ✅ {name}/")
+
+    # Create guide docs in each subfolder
+    for name, folder_id in subfolder_ids.items():
+        content = GUIDE_CONTENT.get(name, "")
+        if not content:
+            continue
+        try:
+            doc = await gdrive_google_docs_create(title="📋 What Goes Here", content=content)
+            doc_status = doc.get("status", "")
+            match = re.search(r"ID: ([A-Za-z0-9_-]+)", str(doc_status))
+            if match:
+                doc_id = match.group(1)
+                await gdrive_move(unified_uri=doc_id, destination_folder_id=folder_id)
+        except Exception as e:
+            print(f"      ℹ️ Guide doc for {name}: {e}")
+
+    return {
+        "folder_id": parent_id,
+        "folder_link": f"https://drive.google.com/drive/folders/{parent_id}",
+        "subfolder_ids": subfolder_ids,
+    }
+
+
+# ── BLA Download + Storage ───────────────────────────────────────────────
 
 async def download_signed_bla(document_id: str) -> str | None:
-    """Download the signed BLA PDF from BoldSign."""
+    """Download signed BLA PDF from BoldSign. Returns local file path."""
     try:
         result = await pd_boldsign_proxy_get(
             f"https://api.boldsign.com/v1/document/download?documentId={document_id}"
         )
         parsed = json.loads(result.get("content", "{}"))
-        status_code = parsed.get("status_code", 200)
-
-        if status_code == 200:
+        if parsed.get("status_code", 200) == 200:
             import base64
             body_raw = parsed.get("body", "")
-            if body_raw:
+            if body_raw and isinstance(body_raw, str):
                 filepath = f"/work/temp/signed_bla_{document_id[:8]}.pdf"
-                if isinstance(body_raw, str):
-                    with open(filepath, "wb") as f:
-                        f.write(base64.b64decode(body_raw))
-                    print(f"    📥 Downloaded signed BLA → {filepath}")
-                    return filepath
-        print(f"    ⚠️ Could not download signed BLA: {status_code}")
+                with open(filepath, "wb") as f:
+                    f.write(base64.b64decode(body_raw))
+                print(f"    📥 Downloaded signed BLA ({filepath})")
+                return filepath
+        print(f"    ⚠️ BLA download returned status {parsed.get('status_code')}")
     except Exception as e:
-        print(f"    ⚠️ Error downloading signed BLA: {e}")
+        print(f"    ⚠️ Error downloading BLA: {e}")
     return None
 
 
-async def store_in_data_room(contact_id: str, signed_bla_path: str, business_name: str) -> bool:
-    """Upload signed BLA to the contact's data room Listing Agreement folder."""
-    if not signed_bla_path:
+async def store_bla_in_data_room(bla_path: str, listing_agreement_folder_id: str,
+                                  company_name: str) -> bool:
+    """Upload signed BLA PDF to the 07 — Listing Agreement subfolder."""
+    if not bla_path or not listing_agreement_folder_id:
+        return False
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        safe = company_name.replace(" ", "_").replace("/", "-")
+        filename = f"Signed_BLA_{safe}_{today}.pdf"
+        await gdrive_upload_file(
+            file_path=bla_path,
+            filename=filename,
+            parent_folder_id=listing_agreement_folder_id,
+        )
+        print(f"    📄 Stored signed BLA: {filename}")
+        return True
+    except Exception as e:
+        print(f"    ⚠️ Error uploading BLA: {e}")
         return False
 
-    try:
-        from sdk.tools.gdrive import gdrive_list_folder, gdrive_upload_file
 
-        # Get drive folder ID from contact
-        result = await pd_highlevel_oauth_proxy_get(
-            url=f"{GHL_API}/contacts/{contact_id}",
+# ── GHL Updates ──────────────────────────────────────────────────────────
+
+async def update_ghl_drive_folder(contact_id: str, folder_id: str) -> bool:
+    """Set drive_folder_id custom field on GHL contact."""
+    try:
+        await pd_highlevel_oauth_update_contact(
+            contactId=contact_id,
+            additionalOptions={
+                "customFields": [{"id": DRIVE_FOLDER_ID_FIELD, "field_value": folder_id}]
+            },
+        )
+        print(f"    📝 GHL drive_folder_id set")
+        return True
+    except Exception as e:
+        print(f"    ⚠️ Error setting drive_folder_id: {e}")
+        return False
+
+
+async def add_onboarding_note(contact_id: str, company_name: str,
+                               folder_link: str) -> bool:
+    """Add onboarding note to GHL contact."""
+    try:
+        today = datetime.now().strftime("%Y-%m-%d")
+        await pd_highlevel_oauth_proxy_post(
+            url=f"{GHL_API}/contacts/{contact_id}/notes",
+            json_body={
+                "body": (
+                    f"🚀 Seller Onboarding — {today}\n\n"
+                    f"Company: {company_name}\n"
+                    f"Data Room: {folder_link}\n\n"
+                    f"9 subfolders + self-help guides loaded.\n"
+                    f"Folders: Financials · Org Structure · Operations · "
+                    f"Legal & Assets · Marketing & Analytics · Signed NDA · "
+                    f"Listing Agreement · LOI · Data Room (buyer-facing)"
+                )
+            },
             headers=GHL_HEADERS,
         )
-        parsed = json.loads(result.get("content", "{}"))
-        body = parsed.get("body", parsed)
-        contact = body.get("contact", body)
-
-        drive_folder_id = None
-        for cf in contact.get("customFields", []):
-            if cf.get("id") == DRIVE_FOLDER_ID_FIELD:
-                drive_folder_id = cf.get("value")
-                break
-
-        if not drive_folder_id:
-            print(f"    ℹ️ No Drive folder on contact — BLA saved locally only")
-            return False
-
-        # Find "07 — Listing Agreement" subfolder
-        listing = await gdrive_list_folder(folder_path=drive_folder_id)
-        items = listing.get("items", [])
-        if isinstance(items, str):
-            items = json.loads(items) if items.startswith("[") else []
-
-        la_folder_id = None
-        for item in items:
-            name = item.get("name", "")
-            if "listing agreement" in name.lower() or "07" in name:
-                la_folder_id = item.get("id")
-                break
-
-        if la_folder_id:
-            today = datetime.now().strftime("%Y-%m-%d")
-            safe_name = business_name.replace(" ", "_").replace("/", "-")
-            filename = f"Signed_BLA_{safe_name}_{today}.pdf"
-            await gdrive_upload_file(
-                file_path=signed_bla_path,
-                filename=filename,
-                parent_folder_id=la_folder_id,
-            )
-            print(f"    📁 Stored signed BLA in data room: {filename}")
-            return True
-        else:
-            print(f"    ⚠️ No Listing Agreement folder found in data room")
+        print(f"    📝 Onboarding note added to GHL")
+        return True
     except Exception as e:
-        print(f"    ⚠️ Error storing in data room: {e}")
+        print(f"    ⚠️ Error adding note: {e}")
+        return False
+
+
+# ── Portal Sync ──────────────────────────────────────────────────────────
+
+async def sync_portal(contact_id: str, company_name: str,
+                       folder_id: str, subfolder_ids: dict) -> bool:
+    """Sync data room info to portal DB."""
+    try:
+        async with httpx.AsyncClient() as client:
+            resp = await client.post(
+                SYNC_URL,
+                json={
+                    "action": "onboarding_complete",
+                    "ghlContactId": contact_id,
+                    "dealName": company_name,
+                    "driveFolderId": folder_id,
+                    "subfolderMap": subfolder_ids,
+                },
+                headers={"Authorization": f"Bearer {SYNC_SECRET}"},
+                timeout=15,
+            )
+            if resp.status_code == 200:
+                print(f"    ✅ Portal synced")
+                return True
+            print(f"    ⚠️ Portal sync failed: {resp.status_code}")
+    except Exception as e:
+        print(f"    ⚠️ Portal sync error: {e}")
     return False
 
 
-async def process_completed_event(event: dict) -> dict:
-    """Process a single BoldSign Completed event."""
+# ── Main Processing ─────────────────────────────────────────────────────
+
+async def process_event(event: dict) -> dict:
+    """Process a single ghl_updated BoldSign event → data room + BLA storage."""
     document_id = event.get("documentId", "")
     document_title = event.get("documentTitle", "Unknown")
     event_id = event.get("_id", "")
@@ -315,51 +368,75 @@ async def process_completed_event(event: dict) -> dict:
 
     results = {
         "contact_found": False,
-        "pipeline_advanced": False,
-        "onboarding_complete": False,
+        "data_room_created": False,
         "bla_stored": False,
+        "ghl_updated": False,
+        "portal_synced": False,
     }
 
-    # 1. Find the GHL contact
-    match = await find_contact_by_boldsign_doc(document_id)
-    if not match:
-        # Fallback: use BoldSign signer email
-        match = await find_contact_from_boldsign_details(document_id)
+    # 1. Find GHL contact
+    contact = await get_contact_by_doc_id(document_id)
+    if not contact:
+        email = await get_signer_email(document_id)
+        if email:
+            contact = await get_contact_by_email(email)
 
-    if not match:
-        error_msg = f"Could not match document {document_id} to any GHL contact"
-        print(f"    ❌ {error_msg}")
-        await mark_event_processed(event_id, error=error_msg)
+    if not contact:
+        error = f"Could not match document {document_id[:12]} to GHL contact"
+        print(f"    ❌ {error}")
+        await mark_event_processed(event_id, error=error)
         return results
 
-    contact_id = match["contact_id"]
-    opp_id = match.get("opp_id")
-    business_name = match.get("opp_name", "Unknown")
+    contact_id = contact.get("id")
+    company_name = get_company_name(contact)
+    contact_name = contact.get("contactName") or contact.get("name", "Unknown")
     results["contact_found"] = True
-    print(f"    🔗 Matched → {business_name} (contact: {contact_id})")
+    print(f"    🔗 Matched: {contact_name} / {company_name} ({contact_id})")
 
-    # 2. Advance pipeline → Listing Agreement Signed
-    if opp_id:
-        results["pipeline_advanced"] = await advance_to_signed(opp_id)
+    # 2. Create data room
+    try:
+        data_room = await create_data_room(company_name)
+        folder_id = data_room["folder_id"]
+        folder_link = data_room["folder_link"]
+        subfolder_ids = data_room["subfolder_ids"]
+        results["data_room_created"] = True
+        print(f"    ✅ Data room created: {folder_link}")
+    except Exception as e:
+        error = f"Data room creation failed: {e}"
+        print(f"    ❌ {error}")
+        await mark_event_processed(event_id, ghl_contact_id=contact_id,
+                                    deal_id=company_name, error=error)
+        return results
 
-    # 3. Run seller onboarding (data room + portal sync)
-    onboard_result = await run_seller_onboarding(contact_id)
-    if "error" not in onboard_result:
-        results["onboarding_complete"] = True
-        print(f"    ✅ Onboarding complete")
+    # 3. Download signed BLA + store in data room
+    bla_path = await download_signed_bla(document_id)
+    if bla_path:
+        la_folder_id = subfolder_ids.get("07 — Listing Agreement")
+        if la_folder_id:
+            results["bla_stored"] = await store_bla_in_data_room(
+                bla_path, la_folder_id, company_name
+            )
+        # Clean up temp file
+        try:
+            import os
+            os.remove(bla_path)
+        except OSError:
+            pass
 
-    # 4. Download signed BLA and store in data room
-    signed_path = await download_signed_bla(document_id)
-    if signed_path:
-        results["bla_stored"] = await store_in_data_room(
-            contact_id, signed_path, business_name
-        )
+    # 4. Update GHL with data room folder ID
+    results["ghl_updated"] = await update_ghl_drive_folder(contact_id, folder_id)
+    await add_onboarding_note(contact_id, company_name, folder_link)
 
-    # 5. Mark event processed
+    # 5. Portal sync with folder mapping
+    results["portal_synced"] = await sync_portal(
+        contact_id, company_name, folder_id, subfolder_ids
+    )
+
+    # 6. Mark event fully processed
     await mark_event_processed(
         event_id,
         ghl_contact_id=contact_id,
-        deal_id=business_name,
+        deal_id=company_name,
         result=json.dumps(results),
     )
 
@@ -367,21 +444,22 @@ async def process_completed_event(event: dict) -> dict:
 
 
 async def main():
-    load_config()
+    print("🔍 Checking for signed BLA events needing data room creation...")
 
-    print("🔍 Checking for completed BLA events...")
-
-    events = await get_pending_events()
+    events = await get_ghl_updated_events()
     if not events:
-        print("   No pending events.")
+        print("   No ghl_updated events. Nothing to do.")
         return
 
-    print(f"   Found {len(events)} pending event(s)")
+    print(f"   Found {len(events)} event(s) pending data room creation")
 
     for event in events:
-        results = await process_completed_event(event)
-        status = "✅" if results["onboarding_complete"] else "⚠️"
-        print(f"  {status} {event.get('documentTitle', '?')}: {results}")
+        results = await process_event(event)
+        ok = results["data_room_created"]
+        status = "✅ COMPLETE" if ok else "⚠️ PARTIAL"
+        print(f"  {status}: {event.get('documentTitle', '?')}")
+        for k, v in results.items():
+            print(f"    {k}: {'✅' if v else '❌'}")
 
     print(f"\n📊 Processed {len(events)} event(s)")
 
